@@ -1,0 +1,693 @@
+/*
+ * SeeLink Installer Wizard
+ * Compatible: Windows 7, 8, 10, 11 (x86 & x64)
+ * Compiler:   MinGW-w64 or MSVC
+ *
+ * Build (MinGW):
+ *   g++ -m32 -o SeeLinkSetup.exe seelink_installer.cpp -mwindows -lcomctl32 -lshell32 -lole32 -luuid -static
+ *   (use -m64 for 64-bit, or build both and let the stub decide)
+ *
+ * The single-exe approach: compile as 32-bit. On a 64-bit OS the WOW64
+ * layer runs it fine, and we detect the OS bitness at runtime to choose
+ * the correct install paths (Program Files vs Program Files (x86)).
+ */
+
+#define UNICODE
+#define _UNICODE
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <commctrl.h>
+#include <shlobj.h>
+#include <shlwapi.h>
+#include <shellapi.h>
+#include <string>
+#include <vector>
+
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "shlwapi.lib")
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+#define APP_NAME        L"SeeLink"
+#define APP_VERSION     L"1.0.0"
+#define PUBLISHER       L"Julentics Industries"
+#define UNINSTALL_KEY   L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\SeeLink"
+
+// Window dimensions
+#define WIZ_W  520
+#define WIZ_H  420
+
+// Page IDs
+#define PAGE_WELCOME   0
+#define PAGE_PATH      1
+#define PAGE_INSTALL   2
+#define PAGE_FINISH    3
+
+// Control IDs
+#define ID_BTN_NEXT    101
+#define ID_BTN_BACK    102
+#define ID_BTN_CANCEL  103
+#define ID_EDIT_PATH   104
+#define ID_BTN_BROWSE  105
+#define ID_PROGRESS    106
+#define ID_STATUS_TEXT 107
+#define ID_CHK_DESKTOP 108
+#define ID_CHK_STARTMENU 109
+
+// Colors
+#define CLR_BG         RGB(13, 15, 20)
+#define CLR_SURFACE    RGB(22, 26, 35)
+#define CLR_ACCENT     RGB(0, 212, 255)
+#define CLR_TEXT       RGB(232, 237, 245)
+#define CLR_MUTED      RGB(90, 99, 120)
+#define CLR_DANGER     RGB(255, 76, 76)
+#define CLR_BORDER     RGB(37, 43, 56)
+
+// ─── Globals ─────────────────────────────────────────────────────────────────
+HINSTANCE g_hInst       = NULL;
+HWND      g_hWnd        = NULL;
+HWND      g_hProgress   = NULL;
+HWND      g_hStatus     = NULL;
+HFONT     g_hFontTitle  = NULL;
+HFONT     g_hFontNormal = NULL;
+HFONT     g_hFontMono   = NULL;
+HBRUSH    g_hBrushBg    = NULL;
+HBRUSH    g_hBrushSurf  = NULL;
+
+int       g_currentPage = PAGE_WELCOME;
+std::wstring g_installPath;
+bool      g_desktopShortcut  = true;
+bool      g_startMenuShortcut = true;
+bool      g_installDone      = false;
+bool      g_installFailed    = false;
+
+// Per-page child windows (destroyed/recreated on page change)
+std::vector<HWND> g_pageControls;
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+// Detect if running on a 64-bit OS (even from a 32-bit process)
+bool IsOS64Bit()
+{
+#if defined(_WIN64)
+    return true;
+#else
+    typedef BOOL (WINAPI *LPFN_ISWOW64PROCESS)(HANDLE, PBOOL);
+    LPFN_ISWOW64PROCESS fn = (LPFN_ISWOW64PROCESS)
+        GetProcAddress(GetModuleHandleW(L"kernel32"), "IsWow64Process");
+    if (fn) {
+        BOOL wow64 = FALSE;
+        fn(GetCurrentProcess(), &wow64);
+        return wow64 == TRUE;
+    }
+    return false;
+#endif
+}
+
+std::wstring GetDefaultInstallPath()
+{
+    wchar_t buf[MAX_PATH] = {};
+    // SHGetFolderPath works on Win XP+; use CSIDL_PROGRAM_FILES for native bitness
+    // For a 32-bit installer on 64-bit OS we want Program Files, not Program Files (x86)
+    if (IsOS64Bit()) {
+        // ExpandEnvironmentStrings for ProgramW6432 gives the real 64-bit folder
+        ExpandEnvironmentStringsW(L"%ProgramW6432%", buf, MAX_PATH);
+    } else {
+        SHGetFolderPathW(NULL, CSIDL_PROGRAM_FILES, NULL, SHGFP_TYPE_CURRENT, buf);
+    }
+    return std::wstring(buf) + L"\\" APP_NAME;
+}
+
+void ClearPageControls()
+{
+    for (HWND h : g_pageControls) DestroyWindow(h);
+    g_pageControls.clear();
+    g_hProgress = NULL;
+    g_hStatus   = NULL;
+}
+
+HWND MakeLabel(HWND parent, const wchar_t* text, int x, int y, int w, int h,
+               HFONT font, COLORREF color = CLR_TEXT, DWORD style = 0)
+{
+    HWND hw = CreateWindowW(L"STATIC", text,
+        WS_CHILD | WS_VISIBLE | SS_LEFT | style,
+        x, y, w, h, parent, NULL, g_hInst, NULL);
+    SendMessageW(hw, WM_SETFONT, (WPARAM)font, TRUE);
+    SetWindowLongPtrW(hw, GWLP_USERDATA, (LONG_PTR)color);
+    g_pageControls.push_back(hw);
+    return hw;
+}
+
+HWND MakeButton(HWND parent, const wchar_t* text, int id, int x, int y, int w, int h)
+{
+    HWND hw = CreateWindowW(L"BUTTON", text,
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        x, y, w, h, parent, (HMENU)(LONG_PTR)id, g_hInst, NULL);
+    SendMessageW(hw, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+    g_pageControls.push_back(hw);
+    return hw;
+}
+
+HWND MakeCheckbox(HWND parent, const wchar_t* text, int id, int x, int y, int w, int h, bool checked)
+{
+    HWND hw = CreateWindowW(L"BUTTON", text,
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        x, y, w, h, parent, (HMENU)(LONG_PTR)id, g_hInst, NULL);
+    SendMessageW(hw, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+    SendMessageW(hw, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
+    g_pageControls.push_back(hw);
+    return hw;
+}
+
+// ─── Pages ───────────────────────────────────────────────────────────────────
+
+void BuildPageWelcome()
+{
+    // Big logo / title area
+    MakeLabel(g_hWnd, L"⬡  SEELINK", 40, 60, 440, 50, g_hFontTitle, CLR_ACCENT, SS_CENTER);
+    MakeLabel(g_hWnd, L"USB File Manager", 40, 115, 440, 24, g_hFontNormal, CLR_MUTED, SS_CENTER);
+
+    // Separator line (static with SS_ETCHEDHORZ)
+    HWND sep = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
+        40, 150, 440, 2, g_hWnd, NULL, g_hInst, NULL);
+    g_pageControls.push_back(sep);
+
+    MakeLabel(g_hWnd,
+        L"Welcome to the SeeLink Setup Wizard.\n\n"
+        L"This will install SeeLink " APP_VERSION L" on your computer.\n\n"
+        L"Click Next to continue or Cancel to exit.",
+        60, 168, 400, 120, g_hFontNormal, CLR_TEXT);
+
+    MakeLabel(g_hWnd,
+        L"Compatible with Windows 7 / 8 / 10 / 11  \u2022  x86 & x64",
+        40, 300, 440, 20, g_hFontNormal, CLR_MUTED, SS_CENTER);
+}
+
+void BuildPagePath()
+{
+    MakeLabel(g_hWnd, L"Installation Folder", 40, 60, 440, 28, g_hFontTitle, CLR_TEXT);
+    MakeLabel(g_hWnd, L"Choose where SeeLink will be installed.", 40, 96, 440, 20, g_hFontNormal, CLR_MUTED);
+
+    HWND sep = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
+        40, 124, 440, 2, g_hWnd, NULL, g_hInst, NULL);
+    g_pageControls.push_back(sep);
+
+    MakeLabel(g_hWnd, L"Destination folder:", 40, 144, 200, 20, g_hFontNormal, CLR_MUTED);
+
+    // Path edit
+    HWND hEdit = CreateWindowW(L"EDIT", g_installPath.c_str(),
+        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+        40, 168, 340, 28, g_hWnd, (HMENU)ID_EDIT_PATH, g_hInst, NULL);
+    SendMessageW(hEdit, WM_SETFONT, (WPARAM)g_hFontMono, TRUE);
+    g_pageControls.push_back(hEdit);
+
+    MakeButton(g_hWnd, L"Browse...", ID_BTN_BROWSE, 390, 168, 90, 28);
+
+    // Space required
+    MakeLabel(g_hWnd, L"Space required: ~5 MB", 40, 210, 300, 20, g_hFontNormal, CLR_MUTED);
+
+    HWND sep2 = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
+        40, 244, 440, 2, g_hWnd, NULL, g_hInst, NULL);
+    g_pageControls.push_back(sep2);
+
+    MakeLabel(g_hWnd, L"Additional options:", 40, 260, 200, 20, g_hFontNormal, CLR_MUTED);
+    MakeCheckbox(g_hWnd, L"Create desktop shortcut", ID_CHK_DESKTOP,   40, 284, 240, 22, g_desktopShortcut);
+    MakeCheckbox(g_hWnd, L"Add to Start Menu",        ID_CHK_STARTMENU, 40, 310, 240, 22, g_startMenuShortcut);
+}
+
+void BuildPageInstall()
+{
+    MakeLabel(g_hWnd, L"Installing SeeLink...", 40, 60, 440, 28, g_hFontTitle, CLR_TEXT);
+    MakeLabel(g_hWnd, L"Please wait while SeeLink is being installed.", 40, 96, 440, 20, g_hFontNormal, CLR_MUTED);
+
+    HWND sep = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
+        40, 124, 440, 2, g_hWnd, NULL, g_hInst, NULL);
+    g_pageControls.push_back(sep);
+
+    // Progress bar
+    g_hProgress = CreateWindowW(PROGRESS_CLASSW, NULL,
+        WS_CHILD | WS_VISIBLE | PBS_SMOOTH,
+        40, 160, 440, 24, g_hWnd, (HMENU)ID_PROGRESS, g_hInst, NULL);
+    SendMessageW(g_hProgress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
+    SendMessageW(g_hProgress, PBM_SETSTEP, 1, 0);
+    g_pageControls.push_back(g_hProgress);
+
+    // Status text
+    g_hStatus = CreateWindowW(L"STATIC", L"Preparing...",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        40, 196, 440, 20, g_hWnd, (HMENU)ID_STATUS_TEXT, g_hInst, NULL);
+    SendMessageW(g_hStatus, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+    g_pageControls.push_back(g_hStatus);
+}
+
+void BuildPageFinish()
+{
+    if (g_installFailed) {
+        MakeLabel(g_hWnd, L"Installation Failed", 40, 60, 440, 28, g_hFontTitle, CLR_DANGER);
+        MakeLabel(g_hWnd,
+            L"SeeLink could not be installed.\n\n"
+            L"Please check that you have administrator rights\n"
+            L"and enough disk space, then try again.",
+            60, 110, 400, 120, g_hFontNormal, CLR_TEXT);
+    } else {
+        MakeLabel(g_hWnd, L"Installation Complete!", 40, 60, 440, 28, g_hFontTitle, CLR_ACCENT);
+        MakeLabel(g_hWnd,
+            L"SeeLink has been successfully installed.\n\n"
+            L"Click Finish to close the Setup Wizard.",
+            60, 110, 400, 80, g_hFontNormal, CLR_TEXT);
+
+        MakeLabel(g_hWnd, L"Installed to:", 60, 210, 100, 20, g_hFontNormal, CLR_MUTED);
+        MakeLabel(g_hWnd, g_installPath.c_str(), 60, 232, 400, 20, g_hFontMono, CLR_TEXT);
+    }
+}
+
+// ─── Install worker ──────────────────────────────────────────────────────────
+
+void SetProgress(int pct, const wchar_t* msg)
+{
+    if (g_hProgress) SendMessageW(g_hProgress, PBM_SETPOS, pct, 0);
+    if (g_hStatus)   SetWindowTextW(g_hStatus, msg);
+}
+
+// Write the uninstall registry entry
+void RegisterUninstall()
+{
+    HKEY hk;
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, UNINSTALL_KEY, 0, NULL,
+                        REG_OPTION_NON_VOLATILE, KEY_WRITE | KEY_WOW64_32KEY,
+                        NULL, &hk, NULL) != ERROR_SUCCESS) return;
+
+    std::wstring exe = g_installPath + L"\\SeeLink.exe";
+    std::wstring uninst = g_installPath + L"\\uninstall.exe";
+
+    auto ws = [&](const wchar_t* name, const std::wstring& val) {
+        RegSetValueExW(hk, name, 0, REG_SZ,
+            (const BYTE*)val.c_str(), (DWORD)((val.size()+1)*sizeof(wchar_t)));
+    };
+    ws(L"DisplayName",          APP_NAME L" " APP_VERSION);
+    ws(L"DisplayVersion",       APP_VERSION);
+    ws(L"Publisher",            PUBLISHER);
+    ws(L"InstallLocation",      g_installPath);
+    ws(L"UninstallString",      uninst);
+    ws(L"DisplayIcon",          exe);
+
+    RegCloseKey(hk);
+}
+
+// Create a .lnk shortcut using IShellLink
+void CreateShortcut(const std::wstring& linkPath, const std::wstring& targetPath,
+                    const std::wstring& workDir, const std::wstring& desc)
+{
+    CoInitialize(NULL);
+    IShellLinkW* psl = NULL;
+    if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
+                                   IID_IShellLinkW, (void**)&psl)))
+    {
+        psl->SetPath(targetPath.c_str());
+        psl->SetWorkingDirectory(workDir.c_str());
+        psl->SetDescription(desc.c_str());
+
+        IPersistFile* ppf = NULL;
+        if (SUCCEEDED(psl->QueryInterface(IID_IPersistFile, (void**)&ppf))) {
+            ppf->Save(linkPath.c_str(), TRUE);
+            ppf->Release();
+        }
+        psl->Release();
+    }
+    CoUninitialize();
+}
+
+DWORD WINAPI InstallThread(LPVOID)
+{
+    // 1. Create install directory
+    SetProgress(5, L"Creating installation directory...");
+    if (!CreateDirectoryW(g_installPath.c_str(), NULL)) {
+        if (GetLastError() != ERROR_ALREADY_EXISTS) {
+            g_installFailed = true;
+            PostMessageW(g_hWnd, WM_COMMAND, MAKEWPARAM(0, BN_CLICKED), 0);
+            return 1;
+        }
+    }
+    Sleep(300);
+
+    // 2. Copy main executable (in a real build you'd extract from resources)
+    SetProgress(20, L"Copying SeeLink files...");
+    wchar_t selfPath[MAX_PATH];
+    GetModuleFileNameW(NULL, selfPath, MAX_PATH);
+    std::wstring destExe = g_installPath + L"\\SeeLink.exe";
+    // For now copy the installer itself as placeholder; replace with your actual binary
+    CopyFileW(selfPath, destExe.c_str(), FALSE);
+    Sleep(400);
+
+    // 3. Write version file
+    SetProgress(40, L"Writing configuration...");
+    std::wstring cfgPath = g_installPath + L"\\version.txt";
+    HANDLE hf = CreateFileW(cfgPath.c_str(), GENERIC_WRITE, 0, NULL,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf != INVALID_HANDLE_VALUE) {
+        const char* ver = "SeeLink 1.0.0\r\nJulentics Industries\r\n";
+        DWORD written;
+        WriteFile(hf, ver, (DWORD)strlen(ver), &written, NULL);
+        CloseHandle(hf);
+    }
+    Sleep(300);
+
+    // 4. Desktop shortcut
+    if (g_desktopShortcut) {
+        SetProgress(55, L"Creating desktop shortcut...");
+        wchar_t desktopPath[MAX_PATH];
+        SHGetFolderPathW(NULL, CSIDL_COMMON_DESKTOPDIRECTORY, NULL,
+                         SHGFP_TYPE_CURRENT, desktopPath);
+        std::wstring lnk = std::wstring(desktopPath) + L"\\SeeLink.lnk";
+        CreateShortcut(lnk, destExe, g_installPath, L"SeeLink USB File Manager");
+        Sleep(200);
+    }
+
+    // 5. Start Menu
+    if (g_startMenuShortcut) {
+        SetProgress(70, L"Adding to Start Menu...");
+        wchar_t smPath[MAX_PATH];
+        SHGetFolderPathW(NULL, CSIDL_COMMON_PROGRAMS, NULL,
+                         SHGFP_TYPE_CURRENT, smPath);
+        std::wstring folder = std::wstring(smPath) + L"\\SeeLink";
+        CreateDirectoryW(folder.c_str(), NULL);
+        std::wstring lnk = folder + L"\\SeeLink.lnk";
+        CreateShortcut(lnk, destExe, g_installPath, L"SeeLink USB File Manager");
+        Sleep(200);
+    }
+
+    // 6. Registry uninstall entry
+    SetProgress(85, L"Registering uninstall entry...");
+    RegisterUninstall();
+    Sleep(300);
+
+    // 7. Done
+    SetProgress(100, L"Installation complete!");
+    Sleep(400);
+
+    g_installDone = true;
+    // Signal main thread to advance to FINISH page
+    PostMessageW(g_hWnd, WM_USER + 1, 0, 0);
+    return 0;
+}
+
+// ─── Page navigation ─────────────────────────────────────────────────────────
+
+void ReadPageOptions()
+{
+    if (g_currentPage == PAGE_PATH) {
+        wchar_t buf[MAX_PATH] = {};
+        HWND hEdit = GetDlgItem(g_hWnd, ID_EDIT_PATH);
+        if (hEdit) GetWindowTextW(hEdit, buf, MAX_PATH);
+        if (wcslen(buf) > 0) g_installPath = buf;
+
+        HWND hChkD = GetDlgItem(g_hWnd, ID_CHK_DESKTOP);
+        HWND hChkS = GetDlgItem(g_hWnd, ID_CHK_STARTMENU);
+        if (hChkD) g_desktopShortcut   = (SendMessageW(hChkD, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        if (hChkS) g_startMenuShortcut = (SendMessageW(hChkS, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    }
+}
+
+void UpdateNavButtons()
+{
+    HWND hNext   = GetDlgItem(g_hWnd, ID_BTN_NEXT);
+    HWND hBack   = GetDlgItem(g_hWnd, ID_BTN_BACK);
+    HWND hCancel = GetDlgItem(g_hWnd, ID_BTN_CANCEL);
+
+    switch (g_currentPage) {
+    case PAGE_WELCOME:
+        SetWindowTextW(hNext, L"Next >");
+        EnableWindow(hBack, FALSE);
+        EnableWindow(hNext, TRUE);
+        EnableWindow(hCancel, TRUE);
+        break;
+    case PAGE_PATH:
+        SetWindowTextW(hNext, L"Install");
+        EnableWindow(hBack, TRUE);
+        EnableWindow(hNext, TRUE);
+        EnableWindow(hCancel, TRUE);
+        break;
+    case PAGE_INSTALL:
+        SetWindowTextW(hNext, L"Next >");
+        EnableWindow(hBack, FALSE);
+        EnableWindow(hNext, FALSE);
+        EnableWindow(hCancel, FALSE);
+        break;
+    case PAGE_FINISH:
+        SetWindowTextW(hNext, L"Finish");
+        EnableWindow(hBack, FALSE);
+        EnableWindow(hNext, TRUE);
+        EnableWindow(hCancel, FALSE);
+        break;
+    }
+}
+
+void ShowPage(int page)
+{
+    ClearPageControls();
+    g_currentPage = page;
+    InvalidateRect(g_hWnd, NULL, TRUE);
+
+    switch (page) {
+    case PAGE_WELCOME: BuildPageWelcome(); break;
+    case PAGE_PATH:    BuildPagePath();    break;
+    case PAGE_INSTALL:
+        BuildPageInstall();
+        UpdateNavButtons();
+        // Kick off install thread
+        CreateThread(NULL, 0, InstallThread, NULL, 0, NULL);
+        return;  // nav buttons updated inside
+    case PAGE_FINISH:  BuildPageFinish();  break;
+    }
+    UpdateNavButtons();
+}
+
+// ─── Window Procedure ────────────────────────────────────────────────────────
+
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg)
+    {
+    case WM_CREATE:
+    {
+        // Fonts
+        g_hFontTitle  = CreateFontW(28, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                            CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        g_hFontNormal = CreateFontW(15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                            CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        g_hFontMono   = CreateFontW(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                            CLEARTYPE_QUALITY, FIXED_PITCH,   L"Consolas");
+
+        g_hBrushBg   = CreateSolidBrush(CLR_BG);
+        g_hBrushSurf = CreateSolidBrush(CLR_SURFACE);
+
+        g_installPath = GetDefaultInstallPath();
+
+        // Bottom nav bar buttons (persistent, not per-page)
+        HWND hCancel = CreateWindowW(L"BUTTON", L"Cancel",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            20, WIZ_H - 54, 90, 32, hwnd, (HMENU)ID_BTN_CANCEL, g_hInst, NULL);
+        SendMessageW(hCancel, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+
+        HWND hBack = CreateWindowW(L"BUTTON", L"< Back",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            WIZ_W - 220, WIZ_H - 54, 90, 32, hwnd, (HMENU)ID_BTN_BACK, g_hInst, NULL);
+        SendMessageW(hBack, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+
+        HWND hNext = CreateWindowW(L"BUTTON", L"Next >",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_DEFPUSHBUTTON,
+            WIZ_W - 120, WIZ_H - 54, 100, 32, hwnd, (HMENU)ID_BTN_NEXT, g_hInst, NULL);
+        SendMessageW(hNext, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+
+        ShowPage(PAGE_WELCOME);
+        break;
+    }
+
+    // Install thread finished → go to finish page
+    case WM_USER + 1:
+        ShowPage(PAGE_FINISH);
+        break;
+
+    case WM_CTLCOLORSTATIC:
+    {
+        HDC hdc = (HDC)wp;
+        HWND hCtrl = (HWND)lp;
+        COLORREF textColor = (COLORREF)GetWindowLongPtrW(hCtrl, GWLP_USERDATA);
+        if (textColor == 0) textColor = CLR_TEXT;
+        SetTextColor(hdc, textColor);
+        SetBkMode(hdc, TRANSPARENT);
+        return (LRESULT)g_hBrushBg;
+    }
+
+    case WM_CTLCOLORBTN:
+    {
+        HDC hdc = (HDC)wp;
+        SetBkMode(hdc, TRANSPARENT);
+        return (LRESULT)g_hBrushBg;
+    }
+
+    case WM_CTLCOLOREDIT:
+    {
+        HDC hdc = (HDC)wp;
+        SetTextColor(hdc, CLR_TEXT);
+        SetBkColor(hdc, CLR_BORDER);
+        return (LRESULT)CreateSolidBrush(CLR_BORDER);
+    }
+
+    case WM_ERASEBKGND:
+    {
+        HDC hdc = (HDC)wp;
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, g_hBrushBg);
+
+        // Draw top banner
+        RECT banner = { 0, 0, WIZ_W, 48 };
+        FillRect(hdc, &banner, g_hBrushSurf);
+
+        // Bottom bar
+        RECT bar = { 0, WIZ_H - 64, WIZ_W, WIZ_H };
+        FillRect(hdc, &bar, g_hBrushSurf);
+
+        // Divider lines
+        HPEN pen = CreatePen(PS_SOLID, 1, CLR_BORDER);
+        HPEN old = (HPEN)SelectObject(hdc, pen);
+        MoveToEx(hdc, 0, 48, NULL); LineTo(hdc, WIZ_W, 48);
+        MoveToEx(hdc, 0, WIZ_H - 64, NULL); LineTo(hdc, WIZ_W, WIZ_H - 64);
+        SelectObject(hdc, old);
+        DeleteObject(pen);
+
+        // Top-left accent dot
+        HBRUSH accentBrush = CreateSolidBrush(CLR_ACCENT);
+        RECT dot = { 12, 16, 18, 32 };
+        FillRect(hdc, &dot, accentBrush);
+        DeleteObject(accentBrush);
+
+        return 1;
+    }
+
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        // App title in banner
+        SelectObject(hdc, g_hFontNormal);
+        SetTextColor(hdc, CLR_ACCENT);
+        SetBkMode(hdc, TRANSPARENT);
+        TextOutW(hdc, 28, 14, L"SeeLink Setup", 13);
+        // Page indicator
+        wchar_t pageStr[32];
+        wsprintfW(pageStr, L"Step %d of 4", g_currentPage + 1);
+        SetTextColor(hdc, CLR_MUTED);
+        RECT pr = { WIZ_W - 120, 14, WIZ_W - 16, 34 };
+        DrawTextW(hdc, pageStr, -1, &pr, DT_RIGHT);
+        EndPaint(hwnd, &ps);
+        break;
+    }
+
+    case WM_COMMAND:
+    {
+        int id = LOWORD(wp);
+
+        if (id == ID_BTN_CANCEL) {
+            if (MessageBoxW(hwnd, L"Are you sure you want to cancel the installation?",
+                            L"Cancel Setup", MB_YESNO | MB_ICONQUESTION) == IDYES)
+                DestroyWindow(hwnd);
+        }
+        else if (id == ID_BTN_NEXT) {
+            ReadPageOptions();
+            if (g_currentPage == PAGE_FINISH) {
+                DestroyWindow(hwnd);
+            } else {
+                ShowPage(g_currentPage + 1);
+            }
+        }
+        else if (id == ID_BTN_BACK) {
+            if (g_currentPage > PAGE_WELCOME)
+                ShowPage(g_currentPage - 1);
+        }
+        else if (id == ID_BTN_BROWSE) {
+            // Folder picker (works Win XP+)
+            BROWSEINFOW bi = {};
+            bi.hwndOwner = hwnd;
+            bi.lpszTitle = L"Select installation folder:";
+            bi.ulFlags   = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+            LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+            if (pidl) {
+                wchar_t path[MAX_PATH];
+                if (SHGetPathFromIDListW(pidl, path)) {
+                    g_installPath = std::wstring(path) + L"\\" APP_NAME;
+                    HWND hEdit = GetDlgItem(hwnd, ID_EDIT_PATH);
+                    if (hEdit) SetWindowTextW(hEdit, g_installPath.c_str());
+                }
+                CoTaskMemFree(pidl);
+            }
+        }
+        break;
+    }
+
+    case WM_DESTROY:
+        DeleteObject(g_hFontTitle);
+        DeleteObject(g_hFontNormal);
+        DeleteObject(g_hFontMono);
+        DeleteObject(g_hBrushBg);
+        DeleteObject(g_hBrushSurf);
+        PostQuitMessage(0);
+        break;
+
+    default:
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+    return 0;
+}
+
+// ─── WinMain ─────────────────────────────────────────────────────────────────
+
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
+{
+    g_hInst = hInst;
+
+    // Enable visual styles (ComCtl32 v6)
+    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_PROGRESS_CLASS | ICC_WIN95_CLASSES };
+    InitCommonControlsEx(&icc);
+
+    // Register window class
+    WNDCLASSEXW wc = {};
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = WndProc;
+    wc.hInstance     = hInst;
+    wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+    wc.hbrBackground = NULL;   // handled in WM_ERASEBKGND
+    wc.lpszClassName = L"SeeLinkInstaller";
+    wc.hIcon         = LoadIconW(NULL, IDI_APPLICATION);
+    RegisterClassExW(&wc);
+
+    // Center on screen
+    int sw = GetSystemMetrics(SM_CXSCREEN);
+    int sh = GetSystemMetrics(SM_CYSCREEN);
+    int wx = (sw - WIZ_W) / 2;
+    int wy = (sh - WIZ_H) / 2;
+
+    g_hWnd = CreateWindowExW(
+        WS_EX_APPWINDOW,
+        L"SeeLinkInstaller",
+        L"SeeLink " APP_VERSION L" Setup",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        wx, wy, WIZ_W, WIZ_H,
+        NULL, NULL, hInst, NULL
+    );
+
+    ShowWindow(g_hWnd, SW_SHOW);
+    UpdateWindow(g_hWnd);
+
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    return (int)msg.wParam;
+}
