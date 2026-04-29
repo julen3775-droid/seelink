@@ -1,0 +1,380 @@
+import customtkinter as ctk
+import os
+import sys
+import threading
+import platform
+from pathlib import Path
+
+
+# ─── Theme ───────────────────────────────────────────────────────────────────
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+ACCENT  = "#00D4FF"
+DANGER  = "#FF4C4C"
+BG      = "#0D0F14"
+SURFACE = "#161A23"
+BORDER  = "#252B38"
+TEXT    = "#E8EDF5"
+MUTED   = "#5A6378"
+
+
+# ─── USB Detection ───────────────────────────────────────────────────────────
+def get_usb_drives():
+    """Return list of (label, path) tuples for removable drives."""
+    drives = []
+    system = platform.system()
+
+    if system == "Windows":
+        import ctypes
+        bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+        for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            if bitmask & 1:
+                path = f"{letter}:\\"
+                dtype = ctypes.windll.kernel32.GetDriveTypeW(path)
+                if dtype == 2:  # DRIVE_REMOVABLE
+                    drives.append((f"USB ({letter}:)", path))
+            bitmask >>= 1
+
+    elif system == "Linux":
+        media_dirs = ["/media", "/run/media"]
+        for base in media_dirs:
+            if os.path.exists(base):
+                for user in os.listdir(base):
+                    user_path = os.path.join(base, user)
+                    if os.path.isdir(user_path):
+                        for mount in os.listdir(user_path):
+                            full = os.path.join(user_path, mount)
+                            drives.append((f"USB ({mount})", full))
+
+    elif system == "Darwin":
+        volumes = "/Volumes"
+        if os.path.exists(volumes):
+            for vol in os.listdir(volumes):
+                full = os.path.join(volumes, vol)
+                if vol != "Macintosh HD" and os.path.ismount(full):
+                    drives.append((f"USB ({vol})", full))
+
+    return drives
+
+
+# ─── App ─────────────────────────────────────────────────────────────────────
+class SeeLinkApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("SeeLink")
+        self.geometry("900x600")
+        self.minsize(700, 480)
+        self.configure(fg_color=BG)
+
+        self.selected_drive = ctk.StringVar()
+        self.drive_map      = {}   # label → path
+        self.selected_file  = None
+
+        self._build_ui()
+        self._refresh_drives()
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+    def _build_ui(self):
+        # ── Header ────────────────────────────────────────────────
+        header = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=0, height=56)
+        header.pack(fill="x", side="top")
+        header.pack_propagate(False)
+
+        ctk.CTkLabel(
+            header, text="⬡  SEELINK",
+            font=ctk.CTkFont(family="Courier New", size=18, weight="bold"),
+            text_color=ACCENT
+        ).pack(side="left", padx=24, pady=14)
+
+        ctk.CTkLabel(
+            header, text="USB File Manager",
+            font=ctk.CTkFont(size=12),
+            text_color=MUTED
+        ).pack(side="left", pady=14)
+
+        # ── Body ──────────────────────────────────────────────────
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=20, pady=16)
+        body.columnconfigure(0, weight=1, minsize=220)
+        body.columnconfigure(1, weight=3)
+        body.rowconfigure(0, weight=1)
+
+        # ── Left panel ────────────────────────────────────────────
+        left = ctk.CTkFrame(body, fg_color=SURFACE, corner_radius=12)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+
+        ctk.CTkLabel(
+            left, text="DRIVES",
+            font=ctk.CTkFont(family="Courier New", size=11, weight="bold"),
+            text_color=MUTED
+        ).pack(anchor="w", padx=16, pady=(16, 6))
+
+        self.drive_menu = ctk.CTkOptionMenu(
+            left,
+            variable=self.selected_drive,
+            command=self._on_drive_selected,
+            fg_color=BORDER,
+            button_color=ACCENT,
+            button_hover_color="#00A8CC",
+            text_color=TEXT,
+            font=ctk.CTkFont(size=13)
+        )
+        self.drive_menu.pack(fill="x", padx=12, pady=(0, 10))
+
+        ctk.CTkButton(
+            left, text="↻  Refresh drives",
+            command=self._refresh_drives,
+            fg_color="transparent",
+            border_color=BORDER,
+            border_width=1,
+            text_color=MUTED,
+            hover_color=BORDER,
+            font=ctk.CTkFont(size=12),
+            height=32
+        ).pack(fill="x", padx=12, pady=(0, 16))
+
+        # Separator
+        ctk.CTkFrame(left, fg_color=BORDER, height=1).pack(fill="x", padx=12)
+
+        ctk.CTkLabel(
+            left, text="SELECTED FILE",
+            font=ctk.CTkFont(family="Courier New", size=11, weight="bold"),
+            text_color=MUTED
+        ).pack(anchor="w", padx=16, pady=(16, 4))
+
+        self.file_label = ctk.CTkLabel(
+            left, text="None",
+            wraplength=160,
+            font=ctk.CTkFont(size=12),
+            text_color=MUTED,
+            justify="left"
+        )
+        self.file_label.pack(anchor="w", padx=16, pady=(0, 12))
+
+        self.size_label = ctk.CTkLabel(
+            left, text="",
+            font=ctk.CTkFont(size=11),
+            text_color=MUTED
+        )
+        self.size_label.pack(anchor="w", padx=16)
+
+        # Spacer
+        ctk.CTkFrame(left, fg_color="transparent").pack(fill="both", expand=True)
+
+        # Clear button
+        self.clear_btn = ctk.CTkButton(
+            left, text="⬛  Clear file",
+            command=self._clear_file,
+            fg_color=DANGER,
+            hover_color="#CC3333",
+            text_color="white",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            height=40,
+            state="disabled"
+        )
+        self.clear_btn.pack(fill="x", padx=12, pady=16)
+
+        # ── Right panel ───────────────────────────────────────────
+        right = ctk.CTkFrame(body, fg_color=SURFACE, corner_radius=12)
+        right.grid(row=0, column=1, sticky="nsew")
+
+        top_bar = ctk.CTkFrame(right, fg_color="transparent")
+        top_bar.pack(fill="x", padx=16, pady=(14, 6))
+
+        ctk.CTkLabel(
+            top_bar, text="FILES",
+            font=ctk.CTkFont(family="Courier New", size=11, weight="bold"),
+            text_color=MUTED
+        ).pack(side="left")
+
+        self.count_label = ctk.CTkLabel(
+            top_bar, text="",
+            font=ctk.CTkFont(size=11),
+            text_color=MUTED
+        )
+        self.count_label.pack(side="right")
+
+        # Search bar
+        self.search_var = ctk.StringVar()
+        self.search_var.trace_add("write", lambda *_: self._filter_files())
+        ctk.CTkEntry(
+            right,
+            placeholder_text="🔍  Search files...",
+            textvariable=self.search_var,
+            fg_color=BORDER,
+            border_color=BORDER,
+            text_color=TEXT,
+            font=ctk.CTkFont(size=13),
+            height=36
+        ).pack(fill="x", padx=12, pady=(0, 8))
+
+        # File list
+        self.file_listbox = ctk.CTkScrollableFrame(
+            right, fg_color="transparent", scrollbar_button_color=BORDER
+        )
+        self.file_listbox.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        self.file_buttons = []   # list of CTkButton
+        self.all_files    = []   # list of Path
+
+        # ── Status bar ────────────────────────────────────────────
+        status = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=0, height=32)
+        status.pack(fill="x", side="bottom")
+        status.pack_propagate(False)
+
+        self.status_label = ctk.CTkLabel(
+            status, text="Ready — connect a USB drive and click Refresh",
+            font=ctk.CTkFont(size=11),
+            text_color=MUTED
+        )
+        self.status_label.pack(side="left", padx=16)
+
+    # ── Logic ─────────────────────────────────────────────────────────────────
+    def _refresh_drives(self):
+        drives = get_usb_drives()
+        self.drive_map = {label: path for label, path in drives}
+        labels = list(self.drive_map.keys()) or ["No USB drives found"]
+        self.drive_menu.configure(values=labels)
+        self.selected_drive.set(labels[0])
+        if drives:
+            self._on_drive_selected(labels[0])
+            self._set_status(f"{len(drives)} drive(s) detected")
+        else:
+            self._set_status("No USB drives found — connect one and refresh")
+            self._clear_list()
+
+    def _on_drive_selected(self, label):
+        path = self.drive_map.get(label)
+        if not path:
+            return
+        self._set_status(f"Reading {path} …")
+        threading.Thread(target=self._load_files, args=(path,), daemon=True).start()
+
+    def _load_files(self, root_path):
+        files = []
+        try:
+            for entry in Path(root_path).rglob("*"):
+                if entry.is_file():
+                    files.append(entry)
+        except PermissionError:
+            pass
+        self.all_files = sorted(files, key=lambda p: p.name.lower())
+        self.after(0, self._render_files)
+
+    def _render_files(self, files=None):
+        if files is None:
+            files = self.all_files
+
+        # Clear old buttons
+        for btn in self.file_buttons:
+            btn.destroy()
+        self.file_buttons.clear()
+        self.selected_file = None
+        self.clear_btn.configure(state="disabled")
+        self.file_label.configure(text="None", text_color=MUTED)
+        self.size_label.configure(text="")
+
+        self.count_label.configure(text=f"{len(files)} file(s)")
+
+        for f in files:
+            btn = ctk.CTkButton(
+                self.file_listbox,
+                text=f.name,
+                anchor="w",
+                fg_color="transparent",
+                hover_color=BORDER,
+                text_color=TEXT,
+                font=ctk.CTkFont(size=12),
+                height=30,
+                command=lambda p=f: self._select_file(p)
+            )
+            btn.pack(fill="x", pady=1)
+            self.file_buttons.append(btn)
+
+        self._set_status(f"Loaded {len(files)} file(s)")
+
+    def _filter_files(self):
+        query = self.search_var.get().lower()
+        filtered = [f for f in self.all_files if query in f.name.lower()]
+        self._render_files(filtered)
+
+    def _select_file(self, path: Path):
+        self.selected_file = path
+        name = path.name
+        size = self._human_size(path.stat().st_size) if path.exists() else "?"
+        self.file_label.configure(text=name, text_color=TEXT)
+        self.size_label.configure(text=size)
+        self.clear_btn.configure(state="normal")
+        self._set_status(f"Selected: {name}  ({size})")
+
+    def _clear_file(self):
+        if not self.selected_file:
+            return
+
+        # Confirm dialog
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Confirm")
+        dialog.geometry("360x160")
+        dialog.resizable(False, False)
+        dialog.configure(fg_color=SURFACE)
+        dialog.grab_set()
+
+        ctk.CTkLabel(
+            dialog,
+            text=f"Clear contents of:\n{self.selected_file.name}?",
+            font=ctk.CTkFont(size=13),
+            text_color=TEXT,
+            wraplength=320
+        ).pack(pady=(24, 12))
+
+        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_row.pack()
+
+        ctk.CTkButton(
+            btn_row, text="Cancel",
+            width=100, fg_color=BORDER,
+            hover_color="#333B4F",
+            command=dialog.destroy
+        ).pack(side="left", padx=8)
+
+        def confirm():
+            dialog.destroy()
+            try:
+                with open(self.selected_file, "w") as f:
+                    f.write("")
+                self.size_label.configure(text="0 B")
+                self._set_status(f"✓ Cleared: {self.selected_file.name}")
+            except Exception as e:
+                self._set_status(f"✗ Error: {e}")
+
+        ctk.CTkButton(
+            btn_row, text="Clear file",
+            width=100, fg_color=DANGER,
+            hover_color="#CC3333",
+            command=confirm
+        ).pack(side="left", padx=8)
+
+    def _clear_list(self):
+        for btn in self.file_buttons:
+            btn.destroy()
+        self.file_buttons.clear()
+        self.all_files.clear()
+        self.count_label.configure(text="")
+
+    def _set_status(self, msg):
+        self.status_label.configure(text=msg)
+
+    @staticmethod
+    def _human_size(n):
+        for unit in ("B", "KB", "MB", "GB"):
+            if n < 1024:
+                return f"{n:.1f} {unit}"
+            n /= 1024
+        return f"{n:.1f} TB"
+
+
+# ─── Entry point ─────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    app = SeeLinkApp()
+    app.mainloop()
