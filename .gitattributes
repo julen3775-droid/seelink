@@ -1,7 +1,2 @@
-# Ajustes de GitHub Linguist para seelink
-# Estos archivos no tienen extensión reconocible; los marcamos como Shell.
-download linguist-language=Shell
-modulewis linguist-language=Shell
-
-# No contar metadatos del editor.
-.vscode/** linguist-generated
+# Archivo revertido intencionalmente.
+# Sin reglas de Linguist activas.
