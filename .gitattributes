@@ -1,2 +1,3 @@
-# Archivo revertido intencionalmente.
-# Sin reglas de Linguist activas.
+download linguist-language=Shell
+modulewis linguist-language=Shell
+.vscode/** linguist-generated
